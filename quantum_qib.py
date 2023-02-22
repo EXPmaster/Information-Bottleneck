@@ -155,9 +155,11 @@ def initialize_sigma_T_X(args):
     #                          for _ in range(args.dim_X)]).to(device)
     sigma_T_X = []
     for i in range(args.dim_X):
-        rand_vec = torch.rand(args.dim_T).cdouble() * 0.25
+        rand_vec = torch.rand(args.dim_T)
+        rand_vec[i] = 0
+        rand_vec = rand_vec / rand_vec.sum() * 0.25
         rand_vec[i] = 0.75
-        sigma_T_X.append(torch.diag(rand_vec))
+        sigma_T_X.append(torch.diag(rand_vec).cdouble())
     return torch.stack(sigma_T_X).to(device)
 
 
