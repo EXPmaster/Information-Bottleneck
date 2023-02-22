@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from qiskit.quantum_info import random_density_matrix
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 
 def set_seed(seed):
@@ -13,7 +15,7 @@ def set_seed(seed):
     torch.use_deterministic_algorithms(True)
 
 
-def is_hermitian(a, tol=1e-3):
+def is_hermitian(a, tol=1e-2):
     """Check if (batch of) matrices a are hermitian."""
     return torch.allclose(a, a.mH)  # torch.dist(a, a.mH) < tol
 
@@ -119,6 +121,11 @@ def relative_entropy(a, b):
     return trace(a @ (matrix_log2(a) - matrix_log2(b)))
 
 
+def entropy(rho):
+    """ Non-batched entropy of density operators. """
+    return -torch.trace(rho @ matrix_log2(rho))
+
+
 def F_alpha(alpha, beta, pX, sigma_T_X, rho_Y_X):
     """ F_alpha(x) for all x in a batch
     """
@@ -142,10 +149,20 @@ def J_gamma_alpha(gamma, alpha, beta, pX, sigma_T_X, sigma_T_X2, rho_Y_X):
             f_alpha(alpha, beta, pX, sigma_T_X2, rho_Y_X)
 
 
-def fixed_gamma_qib(args, pX, rho_Y_X):
+def initialize_sigma_T_X(args):
     # sigma_T_X = torch.stack([torch.from_numpy(random_density_matrix(args.dim_T).data).cdouble() for _ in range(args.dim_X)])
-    sigma_T_X = torch.stack([torch.diag(torch.softmax(torch.rand(args.dim_T), -1)).cdouble()
-                             for _ in range(args.dim_X)]).to(device)
+    # sigma_T_X = torch.stack([torch.diag(torch.softmax(torch.rand(args.dim_T), -1)).cdouble()
+    #                          for _ in range(args.dim_X)]).to(device)
+    sigma_T_X = []
+    for i in range(args.dim_X):
+        rand_vec = torch.rand(args.dim_T).cdouble() * 0.25
+        rand_vec[i] = 0.75
+        sigma_T_X.append(torch.diag(rand_vec))
+    return torch.stack(sigma_T_X).to(device)
+
+
+def fixed_gamma_qib(args, pX, rho_Y_X, rho_X):
+    sigma_T_X = initialize_sigma_T_X(args)
     assert is_hermitian(sigma_T_X), 'sigma_T|X is not hermitian.'
     assert is_positive(sigma_T_X), f'sigma_T|X is not positive.'
     previous_loss = float('inf')
@@ -153,25 +170,34 @@ def fixed_gamma_qib(args, pX, rho_Y_X):
     n = 0
     while not converged:
         sigma_T_X0 = sigma_T_X.clone()
-        sigma_gamma_alpha_T = matrix_exp(matrix_log2(sigma_T_X) - \
+        sigma_gamma_alpha_T = torch.matrix_exp(matrix_log2(sigma_T_X) - \
                                 1 / args.gamma * F_alpha(args.alpha, args.beta, pX, sigma_T_X, rho_Y_X))
         sigma_T_X = sigma_gamma_alpha_T / trace(sigma_gamma_alpha_T)[:, None, None]
-        assert is_hermitian(sigma_T_X), 'sigma_T|X is not hermitian.'
+        assert is_hermitian(sigma_T_X), f'sigma_T|X is not hermitian. dist: {torch.dist(sigma_T_X, sigma_T_X.mH)}'
         # assert is_positive(sigma_T_X), 'sigma_T|X is not positive.'
         loss = J_gamma_alpha(args.gamma, args.alpha, args.beta, pX, sigma_T_X, sigma_T_X0, rho_Y_X)
         # print('loss:', loss)
         f_alpha_value = f_alpha(args.alpha, args.beta, pX, sigma_T_X, rho_Y_X)
-        args.writer.add_scalar('f_alpha', f_alpha_value.real, n)
-        args.writer.add_scalar("J(a, a')", loss.real, n)
-        print('f_alpha:', f_alpha_value.item())
+        # args.writer.add_scalar('f_alpha', f_alpha_value.real, n)
+        # args.writer.add_scalar("J(a, a')", loss.real, n)
+        # print('f_alpha:', f_alpha_value.item())
         if abs(loss.real - previous_loss.real) < args.cvg_thres:
             converged = True
         previous_loss = loss
         n += 1
-    print(sigma_T_X[0].diagonal())
-    print(f'Algorithm converged in {n} iterations.')
-    return sigma_T_X
 
+    # print(f'Algorithm converged in {n} iterations.')
+
+    rho_t = sigma_T(pX, sigma_T_X)
+    rho_x = torch.diag(pX).cdouble()
+    rho_xt = (pX[:, None, None] * batch_kron(rho_X, sigma_T_X)).sum(0)
+    I_TX = entropy(rho_x) + entropy(rho_t) - entropy(rho_xt)
+
+    rho_y = rho_Y(pX, rho_Y_X)
+    rho_yt = sigma_YT(pX, sigma_T_X, rho_Y_X)
+    I_YT = entropy(rho_y) + entropy(rho_t) - entropy(rho_yt)
+    
+    return I_TX, I_YT, n
 
 def rho_theta_lambda(th, la):
     def exp_i(A, theta):
@@ -192,11 +218,23 @@ def gen_rho_y_x(args):
     # thetas = torch.arange(1, args.dim_X + 1) * torch.pi / args.dim_X
     # lambdas = torch.arange(1, args.dim_X + 1) / (4 * args.dim_X)
     # return rho_theta_lambda(thetas, lambdas)
-    alphas = torch.logspace(-1.3, 1.3, args.dim_Y)
-    distr_y = torch.distributions.dirichlet.Dirichlet(alphas)
-    py = distr_y.sample((args.dim_X,))
-    rho_y = torch.diag_embed(py).cdouble()
-    return rho_y.to(device)
+    alphas = torch.logspace(-1.3, 1.3, args.dim_X)
+    rho_y = []
+    for alpha in alphas:
+        distr_y = torch.distributions.dirichlet.Dirichlet(torch.ones(args.dim_Y, dtype=torch.float) * alpha)
+        py = distr_y.sample()
+        rho_y.append(torch.diag(py).cdouble())
+    return torch.stack(rho_y).to(device)
+
+
+def gen_rho_x(args):
+    """ rho_x: [dim_X, dim_X, dim_X], dim_x stacks of {|x><x|} """
+    rho_x = []
+    for i in range(args.dim_X):
+        vec = torch.zeros(args.dim_X).cdouble()
+        vec[i] = 1
+        rho_x.append(torch.outer(vec, vec))
+    return torch.stack(rho_x).to(device)
 
 
 @torch.no_grad()
@@ -204,11 +242,34 @@ def main(args):
     # pX = torch.ones(args.dim_X) / args.dim_X
     distr_x = torch.distributions.dirichlet.Dirichlet(torch.ones(args.dim_X, dtype=torch.float) * 1000)
     pX = distr_x.sample().to(device)
+    rho_X = gen_rho_x(args)
     rho_Y_X = gen_rho_y_x(args).to(device)
     assert is_positive(rho_Y_X), 'rho_Y|X is not positive.'
     assert is_hermitian(rho_Y_X), 'rho_Y|X is not hermitian.'
 
-    fixed_gamma_qib(args, pX, rho_Y_X)
+    x_coords = []
+    y_coords = []
+    betas = []
+    iterations = []
+    for beta in tqdm(torch.arange(0.001, 50, 0.1)):
+        args.beta = beta
+        betas.append(beta)
+        I_TX, I_YT, n = fixed_gamma_qib(args, pX, rho_Y_X, rho_X)
+        iterations.append(n)
+        x_coords.append(I_TX.cpu())
+        y_coords.append(I_YT.cpu())
+    
+    fig = plt.figure()
+    plt.scatter(x_coords, y_coords)
+    plt.xlabel('I(X;T)')
+    plt.ylabel('I(T;Y)')
+    plt.savefig('qib_plane.png')
+
+    fig = plt.figure()
+    plt.plot(betas, iterations)
+    plt.xlabel('beta')
+    plt.ylabel('Iters')
+    plt.savefig('qib_converge_itrs.png')
 
 
 if __name__ == '__main__':
@@ -216,18 +277,18 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', default=0.8, type=float)
     parser.add_argument('--alpha', default=1.0, type=float)
     parser.add_argument('--beta', default=200., type=float)
-    parser.add_argument('--dim_X', default=2**6, type=int, help='dimension of X')
-    parser.add_argument('--dim_Y', default=2**3, type=int, help='dimension of Y')
-    parser.add_argument('--dim_T', default=2**6, type=int, help='dimension of T')
+    parser.add_argument('--dim_X', default=2**4, type=int, help='dimension of X')
+    parser.add_argument('--dim_Y', default=2**2, type=int, help='dimension of Y')
+    parser.add_argument('--dim_T', default=2**4, type=int, help='dimension of T')
     parser.add_argument('--cvg_thres', default=5e-4, type=int, help='threshold for convergence of algorithm')
     args = parser.parse_args()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu' if torch.cuda.is_available() else 'cpu')
     print(f'==== Running quantum algorithm on {device}....')
 
     # set_seed(0)
-    args.writer = SummaryWriter(log_dir='./logs')
+    # args.writer = SummaryWriter(log_dir='./logs')
     main(args)
-    args.writer.flush()
-    args.writer.close()
+    # args.writer.flush()
+    # args.writer.close()
     

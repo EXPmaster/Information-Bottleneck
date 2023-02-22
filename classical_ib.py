@@ -81,7 +81,7 @@ def classical_original_ib(args, pX, p_Y_X):
     q_YT = q_Y_T * q_T[None, :]
     I_YT = (q_YT * (torch.log2(q_YT + 1e-12) - torch.log2(q_T[None, :] * pY[:, None]))).sum()
     # print(f'Algorithm converged in {n} iterations.')
-    return I_TX, I_YT
+    return I_TX, I_YT, n
 
 
 def gen_p_Y_X(args):
@@ -103,18 +103,28 @@ def main(args):
     p_Y_X = gen_p_Y_X(args).to(device)
     x_coords = []
     y_coords = []
-
-    for beta in tqdm(torch.arange(0.001, 100, 0.1)):
+    betas = []
+    iterations = []
+    for beta in tqdm(torch.arange(0.001, 50, 0.1)):
         args.beta = beta
-        I_TX, I_YT = classical_original_ib(args, pX, p_Y_X)
+        betas.append(beta)
+        I_TX, I_YT, n = classical_original_ib(args, pX, p_Y_X)
+        iterations.append(n)
         x_coords.append(I_TX.cpu())
         y_coords.append(I_YT.cpu())
-    
+
     fig = plt.figure()
     plt.scatter(x_coords, y_coords)
     plt.xlabel('I(X;T)')
     plt.ylabel('I(T;Y)')
     plt.savefig('ib_plane.png')
+
+    fig = plt.figure()
+    plt.plot(betas, iterations)
+    plt.xlabel('beta')
+    plt.ylabel('Iters')
+    plt.savefig('converge_itrs.png')
+    
 
 
 if __name__ == '__main__':
